@@ -39,7 +39,7 @@ jobs:
           case $HOUR in
             04|05|06) RUN=00 ;;
             10|11|12) RUN=06 ;;
-            16|17|19) RUN=12 ;;
+            16|17|18) RUN=12 ;;
             22|23|00) RUN=18 ;;
           esac
           YEAR=$(date -u +%Y)
