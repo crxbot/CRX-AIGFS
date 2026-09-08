@@ -65,7 +65,7 @@ jobs:
 
           curl -fSL "${BASE_URL}/temperature_2m.om" -o "data/t2m/temperature_2m.om"
           curl -fSL "${BASE_URL}/precipitation.om"  -o "data/tp6h/precipitation.om"
-          curl -fSL "${BASE_URL}/cloud.om"          -o "data/cloud/cloud.om"
+          curl -fSL "${BASE_URL}/cloud_cover.om"    -o "data/cloud/cloud.om"
 
           
       - name: Upload data as artifact
