@@ -107,7 +107,7 @@ jobs:
         run: |
           mkdir -p aigfs/${{ matrix.variable }}
           input_dir="data/${{ matrix.variable }}"
-          script="scripts/generate_pngs.py"
+          script="scripts/generate_webp.py"
           python "$script" \
             "$input_dir" \
             ifs/${{ matrix.variable }} \
