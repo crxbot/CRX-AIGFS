@@ -5,6 +5,8 @@ on:
     workflows: ["Fetch AIGFS OM File and Generate Webp"] # oder "*" für alle Workflows
     types:
       - completed  # Löst aus, sobald ein Run fertig ist
+permissions: 
+  actions: write
 
 jobs:
   cleanup_old_runs:
@@ -13,7 +15,7 @@ jobs:
       - name: Delete all old workflow runs
         uses: actions/github-script@v7
         with:
-          github-token: ${{ secrets.GH_PAT }}
+          github-token: ${{ secrets.GITHUB_TOKEN }}
           script: |
             // ID des gerade abgeschlossenen Runs
             const currentRunId = context.payload.workflow_run.id;
