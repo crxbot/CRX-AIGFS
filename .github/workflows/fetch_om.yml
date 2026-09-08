@@ -110,7 +110,7 @@ jobs:
           script="scripts/generate_webp.py"
           python "$script" \
             "$input_dir" \
-            ifs/${{ matrix.variable }} \
+            aigfs/${{ matrix.variable }} \
             ${{ matrix.variable }}
 
 
