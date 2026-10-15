@@ -1,132 +1,254 @@
-"""
-Baut eine zentrale meta.json aus allen erzeugten PNGs in output/.
-
-Erwartetes Dateinamensschema (wie von den Rendering-Skripten erzeugt):
-    {var_type}_{YYYYMMDD}_{HHMM}.wepb
-
-var_type darf selbst Unterstriche enthalten (z.B. "tp_acc", "dbz_cmax",
-"change_snow") - das Skript erkennt das Zeitstempel-Suffix per Regex und
-nimmt alles davor als var_type.
-
-Aufruf:
-    python build_meta.py output
-    python build_meta.py output --run 18 --date 20260820
-
---run / --date sind optional. Wenn sie fehlen (z.B. beim lokalen Testen),
-wird "date" aus dem fruehesten gefundenen Timestep abgeleitet und "run"
-bleibt leer - die GitHub-Actions-Workflow-Datei kann sie spaeter einfach
-mitgeben.
-
-Keine externen Abhaengigkeiten - laeuft mit reiner Python-Standardbibliothek
-(math statt numpy), damit dieser Schritt in der CI kein pip install braucht.
-"""
-
-import argparse
-import json
-import math
-import os
-import re
 import sys
-from datetime import datetime, timezone
+import os
+import gc
+import json
+import datetime as dt
+from zoneinfo import ZoneInfo
 
-FILENAME_RE = re.compile(r"^(?P<var_type>.+)_(?P<date>\d{8})_(?P<time>\d{4})\.webp$")
+import numpy as np
+from scipy.interpolate import RegularGridInterpolator
+from omfiles import OmFileReader
+
+from encoding_config import NODATA_U8, LEVELS, ENCODING
 
 # ------------------------------
-# Bounding Box: volle ICON-D2-Modelldomain (fix)
+# Eingabe-/Ausgabe
 # ------------------------------
-# WICHTIG: dieser Wert MUSS exakt mit "extent" im Rendering-Skript
-# uebereinstimmen! Ein PNG traegt selbst keine Geo-Info - die Position
-# auf der Karte wird einzig durch den imageExtent bestimmt. Damit das
-# nicht auseinanderlaufen kann, wird der Wert hier zusaetzlich in die
-# meta.json geschrieben; das HTML kann ihn dann von dort lesen statt
-# ihn separat hart zu codieren.
-EXTENT_LONLAT = [-3.94, 20.34, 43.18, 58.08]  # lon_min, lon_max, lat_min, lat_max
+data_dir = sys.argv[1]        # z.B. "data/t2m"
+output_dir = sys.argv[2]      # z.B. "aigfs/t2m"
+var_type = sys.argv[3]        # 't2m', 'tp6h', 'cloud'
+os.makedirs(output_dir, exist_ok=True)
 
-EARTH_RADIUS = 6378137.0  # Meter, WGS84/Web-Mercator-Kugelradius
+if var_type not in ENCODING:
+    print(f"Unbekannter var_type {var_type}")
+    sys.exit(1)
+enc = ENCODING[var_type]
 
+# ------------------------------
+# var_type -> Substring, der im Dateinamen der zugehoerigen .om Datei steht
+# ------------------------------
+OM_FILENAME_PATTERNS = {
+    "t2m": "temperature_2m",
+    "tp6h": "precipitation",
+    "cloud": "cloud",
+}
 
-def lonlat_to_webmercator(lon_deg, lat_deg):
-    x = EARTH_RADIUS * math.radians(lon_deg)
-    y = EARTH_RADIUS * math.log(math.tan(math.pi / 4 + math.radians(lat_deg) / 2))
-    return x, y
+pattern = OM_FILENAME_PATTERNS.get(var_type)
+if pattern is None:
+    print(f"var_type '{var_type}' hat noch kein Dateinamen-Muster in OM_FILENAME_PATTERNS")
+    sys.exit(1)
 
+# Umrechnung Rohwert -> Anzeige-Einheit, je Variable
+UNIT_CONVERT = {
+    "t2m": lambda v: v - 273.15 if np.nanmax(v) > 200 else v,  # K -> °C, nur falls noetig
+}
+convert = UNIT_CONVERT.get(var_type, lambda v: v)
 
-def compute_extent_3857(extent_lonlat):
-    lon_min, lon_max, lat_min, lat_max = extent_lonlat
-    x_min, y_min = lonlat_to_webmercator(lon_min, lat_min)
-    x_max, y_max = lonlat_to_webmercator(lon_max, lat_max)
-    return [float(x_min), float(y_min), float(x_max), float(y_max)]
+# ------------------------------
+# Globale Bbox der Quelldateien (bestaetigt via crs_wkt-Kind der .om Datei)
+# ------------------------------
+GLOBAL_LAT_MIN, GLOBAL_LON_MIN = -90.0, -180.0
+GLOBAL_LAT_MAX, GLOBAL_LON_MAX = 90.0, 179.75
 
+# Speicherreihenfolge der Lat-Achse in der Datei (Zeile 0 = Norden oder Sueden?).
+# Verifiziert: Zeile 0 = Suedpol -> aufsteigend gespeichert.
+LAT_STORED_DESCENDING = False
 
-def scan_output_dir(output_dir: str):
-    """Durchsucht output_dir (inkl. evtl. Unterordner je var_type) nach
-    PNGs und gruppiert die Timesteps pro var_type."""
-    var_types: dict[str, set[str]] = {}
+# Dimensionsreihenfolge im om-Array: shape=(721,1440,ntime), Zeit ist die LETZTE Dimension.
 
-    for root, _dirs, files in os.walk(output_dir):
-        for fname in files:
-            m = FILENAME_RE.match(fname)
-            if not m:
-                continue
-            var_type = m.group("var_type")
-            ts = f"{m.group('date')}_{m.group('time')}"
-            var_types.setdefault(var_type, set()).add(ts)
+# ------------------------------
+# Ausgaberaster (identisch zum ICON-D2-Raster)
+# ------------------------------
+# regular-lat-lon, EPSG:4326, row0 = Norden, Werte = Pixelzzentren.
+# MUSS zu GRID in generate_metadata.py passen (dort wird die Dateigröße geprüft).
+GRID_LON_MIN, GRID_LAT_MIN, GRID_LON_MAX, GRID_LAT_MAX = -3.94, 43.18, 20.34, 58.08
+GRID_WIDTH, GRID_HEIGHT = 1215, 746
 
-    return var_types
+# Ausschnitt, der aus dem globalen Gitter gelesen wird (= Ausgaberaster)
+extent = [GRID_LON_MIN, GRID_LON_MAX, GRID_LAT_MIN, GRID_LAT_MAX]  # lon_min, lon_max, lat_min, lat_max
 
-
-def build_meta(output_dir: str, run: str | None, date: str | None):
-    var_types_raw = scan_output_dir(output_dir)
-
-    if not var_types_raw:
-        print(f"Keine passenden PNGs in {output_dir} gefunden.", file=sys.stderr)
-
-    var_types_out = {}
-    all_timesteps: list[str] = []
-
-    for var_type in sorted(var_types_raw):
-        timesteps = sorted(var_types_raw[var_type])
-        all_timesteps.extend(timesteps)
-        var_types_out[var_type] = {
-            "num_steps": len(timesteps),
-            "timesteps": timesteps,
-        }
-
-    # date automatisch aus dem fruehesten Timestep ableiten, falls nicht
-    # explizit uebergeben (z.B. spaeter via --date aus der GitHub-Action)
-    if not date:
-        date = min(all_timesteps).split("_")[0] if all_timesteps else ""
-
-    meta = {
-        "run": run or "",
-        "date": date,
-        "generated_at": datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M:%S.%f")[:-3],
-        "crs": "EPSG:3857",
-        "extent": EXTENT_LONLAT,
-        "extent_3857": compute_extent_3857(EXTENT_LONLAT),
-        "var_types": var_types_out,
-    }
-    return meta
+lon_t = np.linspace(GRID_LON_MIN, GRID_LON_MAX, GRID_WIDTH)
+lat_t = np.linspace(GRID_LAT_MAX, GRID_LAT_MIN, GRID_HEIGHT)   # Nord -> Süd
+lat_tt, lon_tt = np.meshgrid(lat_t, lon_t, indexing="ij")      # Shape (HEIGHT, WIDTH)
+target_points = np.column_stack((lat_tt.ravel(), lon_tt.ravel()))
 
 
-def main():
-    png_root = sys.argv[1]
-    run = sys.argv[2]
-    date = sys.argv[3] if len(sys.argv) > 3 else datetime.now(timezone.utc).strftime("%Y%m%d")
+def encode_uint8(data, enc):
+    """float-Array (NaN erlaubt) -> uint8-Array (255 = NoData)."""
+    nan_mask = ~np.isfinite(data)
+    vmin, vmax, tr = enc["vmin"], enc["vmax"], enc["transform"]
+    d = np.where(nan_mask, vmin, data).astype(np.float64)
 
-    meta = build_meta(png_root, run, date)
+    if tr == "raw":
+        q = np.clip(np.rint(d), 0, LEVELS)
+    else:
+        d = np.clip(d, vmin, vmax)
+        if tr == "linear":
+            u = (d - vmin) / (vmax - vmin)
+        elif tr == "sqrt":
+            u = np.sqrt((d - vmin) / (vmax - vmin))
+        elif tr == "ssqrt":
+            u = (np.sign(d) * np.sqrt(np.abs(d) / vmax) + 1.0) / 2.0
+        else:
+            raise ValueError(tr)
+        q = np.rint(u * LEVELS)
 
-    # metadata.json liegt außerhalb des run-Ordners
-    meta_path = os.path.join(os.path.dirname(png_root), "metadata.json")
-    with open(meta_path, "w") as f:
-        json.dump(meta, f, indent=2, ensure_ascii=False)
-
-    print(f"Metadata written to {meta_path}")
-
-    total_vars = len(meta["var_types"])
-    total_files = sum(v["num_steps"] for v in meta["var_types"].values())
-    print(f"meta.json geschrieben: {meta_path} ({total_vars} var_types, {total_files} Dateien)")
+    q = q.astype(np.uint8)
+    q[nan_mask] = NODATA_U8
+    return q
 
 
-if __name__ == "__main__":
-    main()
+def to_target_grid(data, lon, lat):
+    """Reguläres Quellgitter (lat aufsteigend, lon aufsteigend) -> Ausgaberaster
+    (HEIGHT, WIDTH), row0 = Norden, bilinear. Außerhalb des Quellgitters = NaN."""
+    interp = RegularGridInterpolator(
+        (lat, lon), data, method="linear", bounds_error=False, fill_value=np.nan
+    )
+    return interp(target_points).reshape(GRID_HEIGHT, GRID_WIDTH)
+
+
+def compute_crop_indices(nlat, nlon):
+    lat_res = (GLOBAL_LAT_MAX - GLOBAL_LAT_MIN) / (nlat - 1)
+    lon_res = (GLOBAL_LON_MAX - GLOBAL_LON_MIN) / (nlon - 1)
+
+    lon_min, lon_max, lat_min, lat_max = extent
+
+    if LAT_STORED_DESCENDING:
+        row_of = lambda v: (GLOBAL_LAT_MAX - v) / lat_res  # Zeile 0 = Norden
+    else:
+        row_of = lambda v: (v - GLOBAL_LAT_MIN) / lat_res  # Zeile 0 = Sueden
+
+    r1, r2 = sorted([row_of(lat_min), row_of(lat_max)])
+    row_start = max(0, int(np.floor(r1)) - 1)
+    row_end = min(nlat - 1, int(np.ceil(r2)) + 1)
+
+    col_of = lambda v: (v - GLOBAL_LON_MIN) / lon_res
+    col_start = max(0, int(np.floor(col_of(lon_min))) - 1)
+    col_end = min(nlon - 1, int(np.ceil(col_of(lon_max))) + 1)
+
+    return row_start, row_end, col_start, col_end, lat_res, lon_res
+
+
+def crop_lat_lon_arrays(row_start, row_end, col_start, col_end, lat_res, lon_res, nlat):
+    if LAT_STORED_DESCENDING:
+        lat_full = GLOBAL_LAT_MAX - np.arange(nlat) * lat_res
+    else:
+        lat_full = GLOBAL_LAT_MIN + np.arange(nlat) * lat_res
+    lat_crop = lat_full[row_start:row_end + 1]
+    lon_crop = GLOBAL_LON_MIN + np.arange(col_start, col_end + 1) * lon_res
+    return lat_crop, lon_crop
+
+
+def load_valid_times(root, ntime, om_path):
+    """Liest die echten (nicht-gleichmaessigen) Zeitschritte direkt aus dem
+    'time'-Kind der om-Datei (Unix-Timestamps in Sekunden, UTC)."""
+    try:
+        time_child = root.get_child_by_name("time")
+    except Exception as e:
+        raise ValueError(
+            f"{om_path}: kein 'time'-Kind gefunden - kann Zeitstempel nicht bestimmen ({e})"
+        )
+
+    if not time_child.is_array or time_child.shape[0] != ntime:
+        raise ValueError(
+            f"{om_path}: 'time'-Kind passt nicht (shape={time_child.shape}, erwartet ntime={ntime})"
+        )
+
+    raw = time_child.read_array((slice(0, ntime),))
+    return [dt.datetime.fromtimestamp(int(t), tz=dt.timezone.utc) for t in raw]
+
+
+# ------------------------------
+# Dateien durchgehen
+# ------------------------------
+all_files_global = sorted(f for f in os.listdir(data_dir) if f.endswith(".om"))
+matching_files = [f for f in all_files_global if pattern.lower() in f.lower()]
+
+if not matching_files:
+    print(f"Keine .om Datei in {data_dir} gefunden, die zu '{pattern}' passt "
+          f"(gefunden: {all_files_global})")
+
+meta = {
+    "var": var_type,
+    "unit": enc["unit"],
+    "dtype": "uint8",
+    "nodata": NODATA_U8,
+    "levels": LEVELS,
+    "transform": enc["transform"],
+    "vmin": enc["vmin"],
+    "vmax": enc["vmax"],
+    "decode": {
+        "linear": "v = vmin + (q/254) * (vmax - vmin)",
+        "sqrt": "v = vmin + (q/254)^2 * (vmax - vmin)",
+        "ssqrt": "u = q/254*2 - 1; v = sign(u) * u^2 * vmax",
+        "raw": "v = q",
+    }[enc["transform"]],
+    "orientation": "row0 = Norden, row-major, uint8",
+    "projection": "EPSG:4326",
+    "extent_4326": [GRID_LON_MIN, GRID_LAT_MIN, GRID_LON_MAX, GRID_LAT_MAX],
+    "width": GRID_WIDTH,
+    "height": GRID_HEIGHT,
+    "files": [],
+}
+
+for filename in matching_files:
+    om_path = os.path.join(data_dir, filename)
+
+    with OmFileReader(om_path) as root:
+        # root ist gleichzeitig das Datenarray UND hat Metadaten-Kinder
+        # (time, crs_wkt, unit, forecast_reference_time, coordinates, created_at).
+        if not root.is_array:
+            print(f"{om_path}: root ist kein Array (is_group={root.is_group}) - überspringe")
+            continue
+
+        nlat, nlon, ntime = root.shape  # bestaetigt: (lat, lon, time)
+
+        row_start, row_end, col_start, col_end, lat_res, lon_res = compute_crop_indices(nlat, nlon)
+        lat_crop, lon_crop = crop_lat_lon_arrays(row_start, row_end, col_start, col_end, lat_res, lon_res, nlat)
+
+        # Ganzen Ausschnitt fuer ALLE Zeitschritte auf einmal lesen -
+        # passt zum Chunk-Layout (Zeitachse wird ohnehin komplett pro Chunk
+        # gespeichert), spart also viele einzelne read_array-Aufrufe.
+        data_all = root.read_array((
+            slice(row_start, row_end + 1),
+            slice(col_start, col_end + 1),
+            slice(0, ntime),
+        ))  # shape: (nrows, ncols, ntime)
+
+        valid_times_utc = load_valid_times(root, ntime, om_path)
+
+        for t_idx in range(ntime):
+            data = convert(np.asarray(data_all[:, :, t_idx], dtype=np.float64))
+
+            if LAT_STORED_DESCENDING:
+                data = data[::-1, :]  # Zeile 0 -> Sueden, wie RegularGridInterpolator erwartet
+                lat_asc = lat_crop[::-1]
+            else:
+                lat_asc = lat_crop
+
+            # ------------------------------
+            # Quellgitter -> Ausgaberaster -> uint8
+            # ------------------------------
+            grid_data = to_target_grid(data, lon_crop, lat_asc)   # row0 = Norden
+            q = encode_uint8(grid_data, enc)
+
+            valid_time_local = valid_times_utc[t_idx].astimezone(ZoneInfo("Europe/Berlin"))
+            outname = f"{var_type}_{valid_time_local:%Y%m%d_%H%M}"
+            out_path = os.path.join(output_dir, outname)
+            np.ascontiguousarray(q, dtype=np.uint8).tofile(out_path)
+
+            meta["files"].append({
+                "file": outname,
+                "valid_time_utc": valid_times_utc[t_idx].strftime("%Y-%m-%dT%H:%M:%SZ"),
+                "valid_time_local": valid_time_local.strftime("%Y-%m-%dT%H:%M:%S%z"),
+            })
+
+            print(f"{filename} t_idx={t_idx} -> {outname} ({GRID_WIDTH}x{GRID_HEIGHT}, {q.nbytes} Bytes)")
+
+            del data, grid_data, q
+
+        del data_all
+        gc.collect()
+
+print("META: " + json.dumps(meta, ensure_ascii=False))
+print("Fertig!")

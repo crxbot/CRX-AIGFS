@@ -148,6 +148,12 @@ jobs:
         run: |
           python scripts/generate_metadata.py aigfs/${{ needs.fetch_and_generate.outputs.run }} ${{ needs.fetch_and_generate.outputs.run }} ${{ env.DATE }}
 
+      - name: Rohdateien mit gzip komprimieren
+        run: |
+          find aigfs/${{ needs.fetch_and_generate.outputs.run }} -type f | while read -r f; do
+            gzip -9 -n -c "$f" > "$f.tmp" && mv "$f.tmp" "$f"
+          done
+      
       - name: Clean old runs on R2 except current
         run: |
           for run_folder in $(aws s3 ls s3://${{ secrets.R2_BUCKET }}/aigfs/ --endpoint-url https://${{ secrets.R2_ACCOUNT_ID }}.r2.cloudflarestorage.com | awk '{print $2}' | sed 's#/##'); do
@@ -163,7 +169,8 @@ jobs:
         run: |
           # Upload run folder
           aws s3 sync ./aigfs/${{ needs.fetch_and_generate.outputs.run }}/ s3://${{ secrets.R2_BUCKET }}/aigfs/${{ needs.fetch_and_generate.outputs.run }}/ \
-            --endpoint-url https://${{ secrets.R2_ACCOUNT_ID }}.r2.cloudflarestorage.com
+            --endpoint-url https://${{ secrets.R2_ACCOUNT_ID }}.r2.cloudflarestorage.com \
+            --content-type application/gzip
 
           # Upload metadata.json outside run folder
           aws s3 cp ./aigfs/metadata.json s3://${{ secrets.R2_BUCKET }}/aigfs/metadata.json \
